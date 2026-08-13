@@ -77,6 +77,10 @@ public class VoxyClientInstance extends VoxyInstance {
         return this.basePath;
     }
 
+    public Path getWorldStoragePath(WorldIdentifier identifier) {
+        return this.basePath.resolve(identifier.getWorldId());
+    }
+
     @Override
     public boolean isIngestEnabled(WorldIdentifier worldId) {
         return (!this.noIngestOverride) && VoxyConfig.CONFIG.ingestEnabled;

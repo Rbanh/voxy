@@ -242,6 +242,8 @@ dependencies {
     runtimeOnlyMsk(fabricApi.module("fabric-command-api-v2", project.fabric_api_version))
 
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}";
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.0")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:6.1.0")
 
     {
         var (_, mr, ver, _2) = findSodiumVersion()
@@ -281,6 +283,10 @@ dependencies {
     //compileOnly("maven.modrinth:vivecraft:26.1.1-1.3.7-b2-fabric")
 
     //compileOnly("maven.modrinth:flashback:VaqZB1DF")
+}
+
+test {
+    useJUnitPlatform()
 }
 
 

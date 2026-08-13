@@ -7,6 +7,7 @@ import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
+import me.cortex.voxy.client.core.beacon.DistantBeaconBeamManager;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.Viewport;
@@ -35,6 +36,7 @@ import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.sodium.client.util.FogParameters;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.network.chat.Component;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
@@ -42,6 +44,7 @@ import org.joml.Matrix4fc;
 import org.lwjgl.opengl.GL11;
 
 import java.lang.ref.Cleaner;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 
@@ -75,13 +78,14 @@ public class VoxyRenderSystem {
 
     private final AbstractRenderPipeline pipeline;
     private final RenderProperties properties;
+    private final DistantBeaconBeamManager beaconBeamManager;
 
     private static AbstractSectionRenderer.Factory<?,? extends IGeometryData> getRenderBackendFactory() {
         //TODO: need todo a thing where selects optimal section render based on if supports the pipeline and geometry data type
         return MDICSectionRenderer.FACTORY;
     }
 
-    public VoxyRenderSystem(WorldEngine world, ServiceManager sm) {
+    public VoxyRenderSystem(WorldEngine world, ServiceManager sm, long worldHash, Path worldStoragePath) {
         //Keep the world loaded, NOTE: this is done FIRST, to keep and ensure that even if the rest of loading takes more
         // than timeout, we keep the world acquired
         world.acquireRef();
@@ -128,7 +132,12 @@ public class VoxyRenderSystem {
                 this.nodeCleaner = new NodeCleaner(this.nodeManager);
                 this.traversal = new HierarchicalOcclusionTraverser(this.nodeManager, this.nodeCleaner, this.renderGen);
 
-                world.setDirtyCallback(this.nodeManager::worldEvent);
+                this.beaconBeamManager = new DistantBeaconBeamManager(
+                        world, worldHash, worldStoragePath, Minecraft.getInstance().level.getMaxY());
+                world.setDirtyCallback((section, updateFlags, neighborMask) -> {
+                    this.nodeManager.worldEvent(section, updateFlags, neighborMask);
+                    this.beaconBeamManager.worldEvent(section, updateFlags, neighborMask);
+                });
 
                 Arrays.stream(world.getMapper().getBiomeEntries()).forEach(this.modelService::addBiome);
                 world.getMapper().setBiomeCallback(this.modelService::addBiome);
@@ -525,6 +534,7 @@ public class VoxyRenderSystem {
             this.renderGen.addDebugData(debug);
             this.nodeManager.addDebug(debug);
             this.pipeline.addDebug(debug);
+            this.beaconBeamManager.addDebugInfo(debug);
         }
         {
             TimingStatistics.update();
@@ -545,6 +555,8 @@ public class VoxyRenderSystem {
             this.worldIn.setDirtyCallback(null);
             this.worldIn.getMapper().setBiomeCallback(null);
             this.worldIn.getMapper().setStateCallback(null);
+
+            this.beaconBeamManager.shutdown();
 
             this.nodeManager.stop();
 
@@ -581,5 +593,9 @@ public class VoxyRenderSystem {
 
     public WorldEngine getEngine() {
         return this.worldIn;
+    }
+
+    public void appendDistantBeaconStates(LevelRenderState renderState, float partialTick) {
+        this.beaconBeamManager.appendRenderStates(renderState, partialTick);
     }
 }

@@ -84,15 +84,15 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
             Logger.warn("Not creating renderer due to null engine");
             return;
         }
-        this.voxy$createEngineDirect(world);
+        this.voxy$createEngineDirect(world, instance.getWorldStoragePath(this.identifier), this.identifier.getLongHash());
     }
 
     @Unique
-    private void voxy$createEngineDirect(WorldEngine world) {
+    private void voxy$createEngineDirect(WorldEngine world, java.nio.file.Path worldStoragePath, long worldHash) {
         var instance = world.instanceIn;
         if (instance == null) throw new IllegalStateException();//in theory this could be null if is like in a test suit or something
         try {
-            this.renderer = new VoxyRenderSystem(world, instance.getServiceManager());
+            this.renderer = new VoxyRenderSystem(world, instance.getServiceManager(), worldHash, worldStoragePath);
         } catch (RuntimeException e) {
             if (IrisUtil.irisShaderPackEnabled()) {
                 IrisUtil.disableIrisShaders();
