@@ -14,6 +14,7 @@ import net.minecraft.tags.BlockTags;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.level.block.BeaconBeamBlock;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BeaconBlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntityTypes;
 import org.jetbrains.annotations.Nullable;
 
@@ -35,6 +36,7 @@ import java.util.concurrent.locks.LockSupport;
 
 public final class DistantBeaconBeamManager {
     private static final int MAX_RENDERED_BEAMS = 4096;
+    private static final float DISTANT_BEAM_SCALE_DISTANCE = 128.0f;
     private static final long PROGRESS_INTERVAL_NANOS = 10_000_000_000L;
     private static final long SCAN_INTERVAL_NANOS = 50_000_000L;
     private static final int MAX_DIRTY_SECTIONS_PER_PASS = 32;
@@ -46,6 +48,7 @@ public final class DistantBeaconBeamManager {
     private final int maxWorldY;
     private final Set<Long> candidates = ConcurrentHashMap.newKeySet();
     private final Map<Long, BeaconBeamResolver.ResolvedBeam> activeBeams = new ConcurrentHashMap<>();
+    private final Map<Long, BeaconBlockEntity> renderBlockEntities = new ConcurrentHashMap<>();
     private final Set<Long> dirtySections = ConcurrentHashMap.newKeySet();
     private final ArrayDeque<Long> scanBacklog = new ArrayDeque<>();
     private final Thread worker;
@@ -112,15 +115,17 @@ public final class DistantBeaconBeamManager {
         int submitted = 0;
         for (VisibleBeam visible : nearest) {
             var state = new BeaconRenderState();
-            state.blockPos = BlockPos.of(visible.position());
-            state.blockEntityType = BlockEntityTypes.BEACON;
+            var blockPos = BlockPos.of(visible.position());
+            var blockEntity = this.renderBlockEntities.computeIfAbsent(visible.position(), ignored ->
+                    new BeaconBlockEntity(blockPos, Blocks.BEACON.defaultBlockState()));
+            BlockEntityRenderState.extractBase(blockEntity, state, null);
             state.lightCoords = LightCoordsUtil.FULL_BRIGHT;
             state.animationTime = Math.floorMod(renderState.gameTime, 40L) + partialTick;
             double horizontalDistance = Math.sqrt(visible.distanceSquared());
             var player = Minecraft.getInstance().player;
             state.beamRadiusScale = player != null && player.isScoping()
                     ? 1.0f
-                    : Math.max(1.0f, (float)(horizontalDistance / 96.0));
+                    : Math.max(1.0f, (float)(horizontalDistance / DISTANT_BEAM_SCALE_DISTANCE));
             state.sections = visible.beam().segments().stream()
                     .map(segment -> new BeaconRenderState.Section(segment.colour(), segment.height()))
                     .toList();
@@ -146,6 +151,7 @@ public final class DistantBeaconBeamManager {
             Thread.currentThread().interrupt();
         }
         this.saveIndex();
+        this.renderBlockEntities.clear();
     }
 
     private void loadIndex() {
@@ -162,6 +168,7 @@ public final class DistantBeaconBeamManager {
             Logger.warn("Discarding invalid Voxy beacon index at " + this.indexPath + ": " + e.getMessage());
             this.candidates.clear();
             this.activeBeams.clear();
+            this.renderBlockEntities.clear();
             this.scanComplete = false;
             this.scanCursor = BeaconIndexStore.NO_SCAN_CURSOR;
         }
@@ -272,7 +279,9 @@ public final class DistantBeaconBeamManager {
         }
 
         this.candidates.removeIf(position -> isInsideSection(position, sectionX, sectionY, sectionZ));
-        this.activeBeams.keySet().removeIf(position -> isInsideSection(position, sectionX, sectionY, sectionZ));
+        for (long position : this.activeBeams.keySet()) {
+            if (isInsideSection(position, sectionX, sectionY, sectionZ)) this.removeActiveBeam(position);
+        }
 
         WorldSection section = this.world.acquireIfExists(sectionPosition);
         if (section != null) {
@@ -287,7 +296,7 @@ public final class DistantBeaconBeamManager {
 
         for (long candidate : affected) {
             if (this.candidates.contains(candidate)) this.resolveCandidate(candidate);
-            else this.activeBeams.remove(candidate);
+            else this.removeActiveBeam(candidate);
         }
     }
 
@@ -310,9 +319,14 @@ public final class DistantBeaconBeamManager {
         int z = BlockPos.getZ(position);
         try (var lookup = new WorldBlockAccess(this.world)) {
             var resolved = BeaconBeamResolver.resolve(lookup, x, y, z, this.maxWorldY);
-            if (resolved == null) this.activeBeams.remove(position);
+            if (resolved == null) this.removeActiveBeam(position);
             else this.activeBeams.put(position, resolved);
         }
+    }
+
+    private void removeActiveBeam(long position) {
+        this.activeBeams.remove(position);
+        this.renderBlockEntities.remove(position);
     }
 
     private void saveIndex() {

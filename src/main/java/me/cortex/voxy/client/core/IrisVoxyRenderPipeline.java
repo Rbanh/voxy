@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core;
 
 import me.cortex.voxy.client.core.gl.GlBuffer;
+import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
@@ -167,7 +168,10 @@ public class IrisVoxyRenderPipeline extends AbstractRenderPipeline {
 
     @Override
     protected void finish(Viewport<?> viewport, int sourceDepthTexture, int outputFramebuffer, int srcWidth, int srcHeight) {
-        if (this.data.renderToVanillaDepth) {
+        // Shader packs may keep Voxy depth separate for their own composites. Distant beacon
+        // beams are submitted later through Minecraft's block-entity pass, however, so that
+        // pass needs Voxy terrain in the active depth target to occlude the synthetic beams.
+        if (this.data.renderToVanillaDepth || VoxyConfig.CONFIG.renderBeaconBeams) {
             //We can only depthblit out if destination size is the same, if they arnt, force them tobe
             boolean mustFiddledViewport = srcWidth != viewport.width  || srcHeight != viewport.height;
             if (this.data.useViewportDims||!mustFiddledViewport) {
