@@ -16,14 +16,16 @@ import java.util.Map;
 
 public final class BeaconIndexStore {
     private static final int MAGIC = 0x56425859; // VBXY
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
+    public static final long NO_SCAN_CURSOR = Long.MIN_VALUE;
     private static final int MAX_RECORDS = 1_000_000;
     private static final int MAX_SEGMENTS = 512;
 
     private BeaconIndexStore() {}
 
     public record StoredBeam(long position, BeaconBeamResolver.ResolvedBeam beam) {}
-    public record Data(long worldHash, boolean complete, List<Long> candidates, List<StoredBeam> activeBeams) {
+    public record Data(long worldHash, boolean complete, long scanCursor, List<Long> candidates,
+                       List<StoredBeam> activeBeams) {
         public Data {
             candidates = List.copyOf(candidates);
             activeBeams = List.copyOf(activeBeams);
@@ -33,10 +35,12 @@ public final class BeaconIndexStore {
     public static Data load(Path file, long expectedWorldHash) throws IOException {
         try (var input = new DataInputStream(new BufferedInputStream(Files.newInputStream(file)))) {
             if (input.readInt() != MAGIC) throw new IOException("Invalid beacon index magic");
-            if (input.readInt() != VERSION) throw new IOException("Unsupported beacon index version");
+            int version = input.readInt();
+            if (version < 1 || version > VERSION) throw new IOException("Unsupported beacon index version");
             long worldHash = input.readLong();
             if (worldHash != expectedWorldHash) throw new IOException("Beacon index belongs to another world");
             boolean complete = input.readBoolean();
+            long scanCursor = version >= 2 ? input.readLong() : NO_SCAN_CURSOR;
 
             int candidateCount = checkedCount(input.readInt(), MAX_RECORDS, "candidates");
             var candidates = new ArrayList<Long>(candidateCount);
@@ -54,11 +58,12 @@ public final class BeaconIndexStore {
                 }
                 beams.add(new StoredBeam(position, new BeaconBeamResolver.ResolvedBeam(segments, baseLevels)));
             }
-            return new Data(worldHash, complete, candidates, beams);
+            return new Data(worldHash, complete, scanCursor, candidates, beams);
         }
     }
 
-    public static void save(Path file, long worldHash, boolean complete, Collection<Long> candidates,
+    public static void save(Path file, long worldHash, boolean complete, long scanCursor,
+                            Collection<Long> candidates,
                             Map<Long, BeaconBeamResolver.ResolvedBeam> activeBeams) throws IOException {
         Files.createDirectories(file.getParent());
         Path temp = file.resolveSibling(file.getFileName() + ".tmp");
@@ -67,6 +72,7 @@ public final class BeaconIndexStore {
             output.writeInt(VERSION);
             output.writeLong(worldHash);
             output.writeBoolean(complete);
+            output.writeLong(scanCursor);
             output.writeInt(candidates.size());
             for (long candidate : candidates) output.writeLong(candidate);
             output.writeInt(activeBeams.size());

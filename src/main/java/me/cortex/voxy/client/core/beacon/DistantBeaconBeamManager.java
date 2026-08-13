@@ -20,6 +20,7 @@ import org.jetbrains.annotations.Nullable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -35,8 +36,8 @@ import java.util.concurrent.locks.LockSupport;
 public final class DistantBeaconBeamManager {
     private static final int MAX_RENDERED_BEAMS = 4096;
     private static final long PROGRESS_INTERVAL_NANOS = 10_000_000_000L;
-    private static final int SECTIONS_PER_YIELD = 32;
-    private static final long YIELD_NANOS = 10_000_000L;
+    private static final long SCAN_INTERVAL_NANOS = 50_000_000L;
+    private static final int MAX_DIRTY_SECTIONS_PER_PASS = 32;
 
     private final WorldEngine world;
     private final long worldHash;
@@ -46,10 +47,12 @@ public final class DistantBeaconBeamManager {
     private final Set<Long> candidates = ConcurrentHashMap.newKeySet();
     private final Map<Long, BeaconBeamResolver.ResolvedBeam> activeBeams = new ConcurrentHashMap<>();
     private final Set<Long> dirtySections = ConcurrentHashMap.newKeySet();
+    private final ArrayDeque<Long> scanBacklog = new ArrayDeque<>();
     private final Thread worker;
     private final AtomicInteger scannedSections = new AtomicInteger();
     private volatile boolean live = true;
     private volatile boolean scanComplete;
+    private volatile long scanCursor = BeaconIndexStore.NO_SCAN_CURSOR;
     private volatile int lastSubmitted;
 
     public DistantBeaconBeamManager(WorldEngine world, long worldHash, Path worldStoragePath, int maxWorldY) {
@@ -152,6 +155,7 @@ public final class DistantBeaconBeamManager {
             this.candidates.addAll(data.candidates());
             for (var stored : data.activeBeams()) this.activeBeams.put(stored.position(), stored.beam());
             this.scanComplete = data.complete();
+            this.scanCursor = data.scanCursor();
             Logger.info("Loaded Voxy beacon index with " + this.candidates.size() + " candidates and "
                     + this.activeBeams.size() + " active beams");
         } catch (Exception e) {
@@ -159,58 +163,94 @@ public final class DistantBeaconBeamManager {
             this.candidates.clear();
             this.activeBeams.clear();
             this.scanComplete = false;
+            this.scanCursor = BeaconIndexStore.NO_SCAN_CURSOR;
         }
     }
 
     private void runWorker() {
         try {
-            if (!this.scanComplete) this.fullScan();
+            if (!this.scanComplete) this.prepareScanBacklog();
+            long nextScan = System.nanoTime();
+            long nextProgress = nextScan + PROGRESS_INTERVAL_NANOS;
             while (this.live) {
                 boolean changed = false;
+                int dirtyCount = 0;
                 Long dirty;
-                while (this.live && (dirty = this.takeDirtySection()) != null) {
+                while (this.live && dirtyCount++ < MAX_DIRTY_SECTIONS_PER_PASS
+                        && (dirty = this.takeDirtySection()) != null) {
                     this.processDirtySection(dirty);
                     changed = true;
                 }
+
+                long now = System.nanoTime();
+                if (this.live && VoxyConfig.CONFIG.renderBeaconBeams && !this.scanComplete
+                        && now >= nextScan) {
+                    Long sectionPosition = this.scanBacklog.pollFirst();
+                    if (sectionPosition == null) {
+                        this.scanComplete = true;
+                        changed = true;
+                        Logger.info("Voxy beacon index complete: " + this.scannedSections.get() + " sections, "
+                                + this.candidates.size() + " candidates, " + this.activeBeams.size() + " active beams");
+                    } else {
+                        this.scanSection(sectionPosition);
+                        nextScan = now + SCAN_INTERVAL_NANOS;
+                    }
+                }
+
+                now = System.nanoTime();
+                if (now >= nextProgress) {
+                    nextProgress = now + PROGRESS_INTERVAL_NANOS;
+                    if (!this.scanComplete && VoxyConfig.CONFIG.renderBeaconBeams) {
+                        Logger.info("Voxy beacon index progress: " + this.scannedSections.get() + " sections, "
+                                + this.scanBacklog.size() + " queued, " + this.candidates.size() + " candidates");
+                    }
+                    changed = true;
+                }
                 if (changed) this.saveIndex();
-                if (this.live) LockSupport.parkNanos(250_000_000L);
+                if (this.live) {
+                    long wait = VoxyConfig.CONFIG.renderBeaconBeams && !this.scanComplete
+                            ? Math.max(1_000_000L, nextScan - System.nanoTime())
+                            : 250_000_000L;
+                    LockSupport.parkNanos(Math.min(wait, 250_000_000L));
+                }
             }
         } catch (Exception e) {
             if (this.live) Logger.error("Voxy beacon indexer failed", e);
         }
     }
 
-    private void fullScan() {
-        Logger.info("Building Voxy beacon index from stored level-0 sections");
-        long[] lastProgress = {System.nanoTime()};
+    private void prepareScanBacklog() {
+        Logger.info("Preparing throttled Voxy beacon index from stored level-0 sections");
+        var storedPositions = new ArrayList<Long>();
         this.world.storage.iteratePositions(0, sectionPosition -> {
             if (!this.live) throw CancelledScan.INSTANCE;
-            WorldSection section = this.world.acquireIfExists(sectionPosition);
-            if (section != null) {
-                try {
-                    for (long candidate : this.findBeacons(section)) {
-                        this.candidates.add(candidate);
-                        this.resolveCandidate(candidate);
-                    }
-                } finally {
-                    section.release();
-                }
-            }
-            int count = this.scannedSections.incrementAndGet();
-            if ((count % SECTIONS_PER_YIELD) == 0) LockSupport.parkNanos(YIELD_NANOS);
-            long now = System.nanoTime();
-            if (now - lastProgress[0] >= PROGRESS_INTERVAL_NANOS) {
-                lastProgress[0] = now;
-                Logger.info("Voxy beacon index progress: " + count + " sections, " + this.candidates.size() + " candidates");
-                this.saveIndex();
-            }
+            storedPositions.add(sectionPosition);
         });
-        if (this.live) {
-            this.scanComplete = true;
-            this.saveIndex();
-            Logger.info("Voxy beacon index complete: " + this.scannedSections.get() + " sections, "
-                    + this.candidates.size() + " candidates, " + this.activeBeams.size() + " active beams");
+        int start = 0;
+        if (this.scanCursor != BeaconIndexStore.NO_SCAN_CURSOR) {
+            int cursorIndex = storedPositions.indexOf(this.scanCursor);
+            if (cursorIndex >= 0) start = cursorIndex + 1;
+            else Logger.warn("Voxy beacon scan cursor is no longer present; restarting the throttled scan");
         }
+        for (int i = start; i < storedPositions.size(); i++) this.scanBacklog.addLast(storedPositions.get(i));
+        if (this.live) Logger.info("Queued " + this.scanBacklog.size()
+                + " Voxy sections for beacon indexing at no more than 20 sections/second");
+    }
+
+    private void scanSection(long sectionPosition) {
+        WorldSection section = this.world.loadSectionSnapshot(sectionPosition);
+        if (section != null) {
+            try {
+                for (long candidate : this.findBeacons(section)) {
+                    this.candidates.add(candidate);
+                    this.resolveCandidate(candidate);
+                }
+            } finally {
+                section.release();
+            }
+        }
+        this.scannedSections.incrementAndGet();
+        this.scanCursor = sectionPosition;
     }
 
     private @Nullable Long takeDirtySection() {
@@ -277,7 +317,8 @@ public final class DistantBeaconBeamManager {
 
     private void saveIndex() {
         try {
-            BeaconIndexStore.save(this.indexPath, this.worldHash, this.scanComplete, this.candidates, this.activeBeams);
+            BeaconIndexStore.save(this.indexPath, this.worldHash, this.scanComplete, this.scanCursor,
+                    this.candidates, this.activeBeams);
         } catch (IOException e) {
             Logger.error("Failed to save Voxy beacon index", e);
         }
@@ -327,7 +368,7 @@ public final class DistantBeaconBeamManager {
             if (this.missing.contains(sectionPosition)) return null;
             WorldSection section = this.sections.get(sectionPosition);
             if (section == null) {
-                section = this.world.acquireIfExists(sectionPosition);
+                section = this.world.loadSectionSnapshot(sectionPosition);
                 if (section == null) {
                     this.missing.add(sectionPosition);
                     return null;

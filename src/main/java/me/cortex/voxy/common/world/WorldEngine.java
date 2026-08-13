@@ -84,6 +84,25 @@ public final class WorldEngine {
         return this.sectionTracker.acquire(pos, true);
     }
 
+    /**
+     * Loads an isolated snapshot directly from storage without inserting it into the live
+     * active-section cache. The caller owns the returned reference and must release it.
+     * This is intended for low-priority inspection that must not evict render-critical data.
+     */
+    public @Nullable WorldSection loadSectionSnapshot(long pos) {
+        if (!this.isLive) throw new IllegalStateException("World is not live");
+        var section = new WorldSection(getLevel(pos), getX(pos), getY(pos), getZ(pos), null);
+        section.acquire(1);
+        try {
+            if (this.storage.loadSection(section) == 0) return section;
+        } catch (RuntimeException | Error e) {
+            section.release();
+            throw e;
+        }
+        section.release();
+        return null;
+    }
+
     public static final int POS_FORMAT_VERSION = 1;
 
     //TODO: Fixme/optimize, cause as the lvl gets higher, the size of x,y,z gets smaller so i can dynamically compact the format
